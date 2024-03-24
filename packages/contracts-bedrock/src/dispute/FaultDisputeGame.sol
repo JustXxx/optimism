@@ -16,6 +16,7 @@ import { LibClock } from "src/dispute/lib/LibUDT.sol";
 
 import "src/libraries/DisputeTypes.sol";
 import "src/libraries/DisputeErrors.sol";
+import "forge-std/console.sol";
 
 /// @title FaultDisputeGame
 /// @notice An implementation of the `IFaultDisputeGame` interface.
@@ -166,6 +167,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
         // Determine the expected pre & post states of the step.
         Claim preStateClaim;
+        ClaimData storage preState;
         ClaimData storage postState;
         if (_isAttack) {
             // If the step position's index at depth is 0, the prestate is the absolute
@@ -179,14 +181,26 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             preStateClaim = (stepPos.indexAtDepth() % (1 << (MAX_GAME_DEPTH - SPLIT_DEPTH))) == 0
                 ? ABSOLUTE_PRESTATE
                 : _findTraceAncestor(Position.wrap(parentPos.raw() - 1), parent.parentIndex, false).claim;
+            if ((stepPos.indexAtDepth() % (1 << (MAX_GAME_DEPTH - SPLIT_DEPTH))) == 0) {
+                preState = claimData[0];
+            } else {
+                preState = _findTraceAncestor(Position.wrap(parentPos.raw() - 1), parent.parentIndex, false);
+            }
             // For all attacks, the poststate is the parent claim.
             postState = parent;
         } else {
             // If the step is a defense, the poststate exists elsewhere in the game state,
             // and the parent claim is the expected pre-state.
+            preState = parent;
             preStateClaim = parent.claim;
             postState = _findTraceAncestor(Position.wrap(parentPos.raw() + 1), parent.parentIndex, false);
         }
+
+        console.log("step fun, preState pos", preState.position.raw());
+        console.log("step fun, postState pos", postState.position.raw());
+        console.logBytes32(keccak256(_stateData) << 8);
+        console.logBytes32(preStateClaim.raw() << 8);
+
 
         // INVARIANT: The prestate is always invalid if the passed `_stateData` is not the
         //            preimage of the prestate claim hash.
