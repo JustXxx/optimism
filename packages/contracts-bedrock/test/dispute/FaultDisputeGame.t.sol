@@ -505,7 +505,7 @@ contract FaultDisputeGame_Test is FaultDisputeGame_Init {
         gameProxy.attack{ value: MIN_BOND }(2, _dummyClaim());
         gameProxy.attack{ value: MIN_BOND }(3, _dummyClaim());
         gameProxy.attack{ value: MIN_BOND }(4, _changeClaimStatus(_dummyClaim(), VMStatuses.PANIC));
-        gameProxy.attack{ value: MIN_BOND }(5, absolutePrestate());
+        gameProxy.attack{ value: MIN_BOND }(5, absolutePrestate);
         gameProxy.defend{ value: MIN_BOND }(6, _dummyClaim());
         gameProxy.attack{ value: MIN_BOND }(7, _dummyClaim());
         gameProxy.addLocalData(LocalPreimageKey.DISPUTED_L2_BLOCK_NUMBER, 8, 0);
