@@ -322,6 +322,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
                 clock: nextClock
             })
         );
+        console.log("claimData.push parentIndex:%d, pos:%d", uint32(_challengeIndex), nextPosition.raw());
 
         // Update the subgame rooted at the parent claim.
         subgames[_challengeIndex].push(claimData.length - 1);
