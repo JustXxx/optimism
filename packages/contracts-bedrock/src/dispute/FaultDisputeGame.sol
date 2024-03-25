@@ -794,6 +794,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
         // If the starting claim's depth is less than or equal to the split depth, we revert as this is UB.
         if (claim.position.depth() <= SPLIT_DEPTH) revert ClaimAboveSplit();
+        console.log("_findStartingAndDisputedOutputs start:%d, pos:%d, depth:%d", _start, claim.position.raw(), claim.position.depth());
 
         // We want to:
         // 1. Find the first claim at the split depth.
@@ -842,6 +843,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             (startingClaim_, startingPos_) = (claim.claim, claim.position);
             (disputedClaim_, disputedPos_) = (disputed.claim, disputed.position);
         }
+        console.log("_findStartingAndDisputedOutputs start:%d, startingPos_:%d, disputedPos_:%d", _start, startingPos_.raw(), disputedPos_.raw());
     }
 
     /// @notice Finds the local context hash for a given claim index that is present in an execution trace subgame.
