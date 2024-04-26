@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSimple_ChallengerWins(t *testing.T) {
+func TestSimple_Alphabet_ChallengerWins(t *testing.T) {
 	op_e2e.InitParallel(t)
 	ctx := context.Background()
 	sys, l1Client := startFaultDisputeSystem(t)
@@ -47,6 +47,27 @@ func TestSimple_ChallengerWins(t *testing.T) {
 	 *game.LogGameData(ctx)
 	 *_ = claim.WaitForCounterClaim(ctx)
 	 */
+
+	sys.TimeTravelClock.AdvanceTime(game.GameDuration(ctx))
+	require.NoError(t, wait.ForNextBlock(ctx, l1Client))
+	game.WaitForGameStatus(ctx, disputegame.StatusChallengerWins)
+	game.LogGameData(ctx)
+}
+
+func TestSimple_Cannon_ChallengerWins(t *testing.T) {
+	op_e2e.InitParallel(t)
+	ctx := context.Background()
+	sys, l1Client := startFaultDisputeSystem(t)
+	t.Cleanup(sys.Close)
+
+	disputeGameFactory := disputegame.NewFactoryHelper(t, ctx, sys)
+	game := disputeGameFactory.StartOutputCannonGame(ctx, "sequencer", 3, common.Hash{0x01, 0xaa})
+	require.NotNil(t, game)
+	claim := game.DisputeLastBlock(ctx)
+
+	// Create the root of the cannon trace.
+	claim = claim.Attack(ctx, common.Hash{0x01})
+	game.LogGameData(ctx)
 
 	sys.TimeTravelClock.AdvanceTime(game.GameDuration(ctx))
 	require.NoError(t, wait.ForNextBlock(ctx, l1Client))
