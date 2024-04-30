@@ -133,6 +133,13 @@ func (p Position) Defend() Position {
 	return p.parent().move(true).move(false)
 }
 
+func (p Position) MoveN(bits uint, branch *big.Int) Position {
+	move := new(big.Int)
+	move.Or(branch, p.ToGIndex())
+	move.Lsh(move, bits)
+	return NewPositionFromGIndex(move)
+}
+
 func (p Position) Print(maxDepth Depth) {
 	fmt.Printf("GIN: %4b\tTrace Position is %4b\tTrace Depth is: %d\tTrace Index is: %d\n", p.ToGIndex(), p.indexAtDepth, p.depth, p.TraceIndex(maxDepth))
 }

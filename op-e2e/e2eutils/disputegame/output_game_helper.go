@@ -94,7 +94,7 @@ func (g *OutputGameHelper) GenesisBlockNum(ctx context.Context) uint64 {
 }
 
 func (g *OutputGameHelper) DisputeLastBlock(ctx context.Context) *ClaimHelper {
-	return g.DisputeBlock(ctx, g.L2BlockNum(ctx))
+	return g.DisputeBlockV2(ctx, g.L2BlockNum(ctx))
 }
 
 // DisputeBlock posts claims from both the honest and dishonest actor to progress the output root part of the game
@@ -152,6 +152,7 @@ func (g *OutputGameHelper) DisputeBlockV2(ctx context.Context, disputeBlockNum u
 		dishonestValue = common.Hash{0xff, 0xff, 0xff}
 	}
 	pos := types.NewPositionFromGIndex(big.NewInt(1))
+	g.t.Logf("init pos: %v", pos)
 	getClaimValue := func(parentClaim *ClaimHelper, claimPos types.Position) common.Hash {
 		claimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(claimPos)
 		g.require.NoError(err, "failed to calculate claim block number")
@@ -169,14 +170,19 @@ func (g *OutputGameHelper) DisputeBlockV2(ctx context.Context, disputeBlockNum u
 		}
 	}
 
+	g.t.Logf("SplitDepth:%v, MaxDepth:%v", g.SplitDepth(ctx), g.MaxDepth(ctx))
+	g.t.Logf("disputeBlockNum: %v", disputeBlockNum)
 	tmp_pos := types.NewPositionFromGIndex(big.NewInt(2))
 	g.t.Logf("tmp_pos.Attack befor pos: %v", tmp_pos)
+	g.t.Logf("tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(0)))
 	tmp_pos = tmp_pos.Attack()
 	g.t.Logf("tmp_pos.Attack after pos: %v", tmp_pos)
+	g.t.Logf("tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(1)))
 	tmp_pos = tmp_pos.Defend()
 	g.t.Logf("tmp_pos.Defend after tmp_pos: %v", tmp_pos)
 
 	claim := g.RootClaim(ctx)
+	g.t.Logf("root claim: %v", claim)
 	for !claim.IsOutputRootLeaf(ctx) {
 		parentClaimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(pos)
 		g.require.NoError(err, "failed to calculate parent claim block number")

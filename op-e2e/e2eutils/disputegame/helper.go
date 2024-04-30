@@ -167,13 +167,13 @@ func (h *FactoryHelper) StartOutputCannonGame(ctx context.Context, l2Node string
 	logger := testlog.Logger(h.t, log.LevelInfo).New("role", "OutputCannonGameHelper")
 	rollupClient := h.system.RollupClient(l2Node)
 
-	// 区块号
+	// 区块号 l2BlockNumber
 	extraData := h.createBisectionGameExtraData(l2Node, l2BlockNumber, cfg)
 
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 	defer cancel()
 
-	// 创建DisputeGameFactory合约
+	// 调用DisputeGameFactory合约的Create方法, 创建一个DisputeGame合约
 	tx, err := transactions.PadGasEstimate(h.opts, 2, func(opts *bind.TransactOpts) (*types.Transaction, error) {
 		return h.factory.Create(opts, cannonGameType, rootClaim, extraData)
 	})
@@ -184,7 +184,6 @@ func (h *FactoryHelper) StartOutputCannonGame(ctx context.Context, l2Node string
 	createdEvent, err := h.factory.ParseDisputeGameCreated(*rcpt.Logs[1])
 	h.require.NoError(err)
 
-	// 准备DisputeGame合约
 	game, err := bindings.NewFaultDisputeGame(createdEvent.DisputeProxy, h.client)
 	h.require.NoError(err)
 
