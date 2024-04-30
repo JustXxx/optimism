@@ -142,6 +142,59 @@ func (g *OutputGameHelper) DisputeBlock(ctx context.Context, disputeBlockNum uin
 	return claim
 }
 
+func (g *OutputGameHelper) DisputeBlockV2(ctx context.Context, disputeBlockNum uint64) *ClaimHelper {
+	dishonestValue := g.GetClaimValue(ctx, 0)
+	correctRootClaim := g.correctOutputRoot(ctx, types.NewPositionFromGIndex(big.NewInt(1)))
+	rootIsValid := dishonestValue == correctRootClaim
+	if rootIsValid {
+		// Ensure that the dishonest actor is actually posting invalid roots.
+		// Otherwise, the honest challenger will defend our counter and ruin everything.
+		dishonestValue = common.Hash{0xff, 0xff, 0xff}
+	}
+	pos := types.NewPositionFromGIndex(big.NewInt(1))
+	getClaimValue := func(parentClaim *ClaimHelper, claimPos types.Position) common.Hash {
+		claimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(claimPos)
+		g.require.NoError(err, "failed to calculate claim block number")
+		if claimBlockNum < disputeBlockNum {
+			// Use the correct output root for all claims prior to the dispute block number
+			// This pushes the game to dispute the last block in the range
+			return g.correctOutputRoot(ctx, claimPos)
+		}
+		if rootIsValid == parentClaim.AgreesWithOutputRoot() {
+			// We are responding to a parent claim that agrees with a valid root, so we're being dishonest
+			return dishonestValue
+		} else {
+			// Otherwise we must be the honest actor so use the correct root
+			return g.correctOutputRoot(ctx, claimPos)
+		}
+	}
+
+	tmp_pos := types.NewPositionFromGIndex(big.NewInt(2))
+	g.t.Logf("tmp_pos.Attack befor pos: %v", tmp_pos)
+	tmp_pos = tmp_pos.Attack()
+	g.t.Logf("tmp_pos.Attack after pos: %v", tmp_pos)
+	tmp_pos = tmp_pos.Defend()
+	g.t.Logf("tmp_pos.Defend after tmp_pos: %v", tmp_pos)
+
+	claim := g.RootClaim(ctx)
+	for !claim.IsOutputRootLeaf(ctx) {
+		parentClaimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(pos)
+		g.require.NoError(err, "failed to calculate parent claim block number")
+		if parentClaimBlockNum >= disputeBlockNum {
+			g.t.Logf("pos.Attack befor pos: %v", pos)
+			pos = pos.Attack()
+			g.t.Logf("pos.Attack after pos: %v", pos)
+			claim = claim.Attack(ctx, getClaimValue(claim, pos))
+		} else {
+			g.t.Logf("pos.Defend befor pos: %v", pos)
+			pos = pos.Defend()
+			g.t.Logf("pos.Defend after pos: %v", pos)
+			claim = claim.Defend(ctx, getClaimValue(claim, pos))
+		}
+	}
+	return claim
+}
+
 func (g *OutputGameHelper) RootClaim(ctx context.Context) *ClaimHelper {
 	claim := g.getClaim(ctx, 0)
 	return newClaimHelper(g, 0, claim)
