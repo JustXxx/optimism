@@ -66,11 +66,13 @@ func TestSimple_Cannon_ChallengerWins(t *testing.T) {
 	claim := game.DisputeLastBlock(ctx)
 
 	// Create the root of the cannon trace.
-	claim = claim.Attack(ctx, common.Hash{0x01})
-	game.LogGameData(ctx)
+	//claim = claim.Attack(ctx, common.Hash{0x01})
+	claim = claim.AttackAt(ctx, common.Hash{0x01}, 0)
+	game.LogGameDataF(ctx, "AttackAt[0]")
 
-	sys.TimeTravelClock.AdvanceTime(game.GameDuration(ctx))
+	t.Logf("TestLog GameDuration: %v", game.GameDuration(ctx))
+	sys.TimeTravelClock.AdvanceTime(game.GameDuration(ctx) * 2)
 	require.NoError(t, wait.ForNextBlock(ctx, l1Client))
 	game.WaitForGameStatus(ctx, disputegame.StatusChallengerWins)
-	game.LogGameData(ctx)
+	game.LogGameDataF(ctx, "ChallengerWins")
 }

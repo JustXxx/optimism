@@ -152,7 +152,6 @@ func (g *OutputGameHelper) DisputeBlockV2(ctx context.Context, disputeBlockNum u
 		dishonestValue = common.Hash{0xff, 0xff, 0xff}
 	}
 	pos := types.NewPositionFromGIndex(big.NewInt(1))
-	g.t.Logf("init pos: %v", pos)
 	getClaimValue := func(parentClaim *ClaimHelper, claimPos types.Position) common.Hash {
 		claimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(claimPos)
 		g.require.NoError(err, "failed to calculate claim block number")
@@ -170,33 +169,40 @@ func (g *OutputGameHelper) DisputeBlockV2(ctx context.Context, disputeBlockNum u
 		}
 	}
 
-	g.t.Logf("SplitDepth:%v, MaxDepth:%v", g.SplitDepth(ctx), g.MaxDepth(ctx))
-	g.t.Logf("disputeBlockNum: %v", disputeBlockNum)
-	tmp_pos := types.NewPositionFromGIndex(big.NewInt(2))
-	g.t.Logf("tmp_pos.Attack befor pos: %v", tmp_pos)
-	g.t.Logf("tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(0)))
-	tmp_pos = tmp_pos.Attack()
-	g.t.Logf("tmp_pos.Attack after pos: %v", tmp_pos)
-	g.t.Logf("tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(1)))
-	tmp_pos = tmp_pos.Defend()
-	g.t.Logf("tmp_pos.Defend after tmp_pos: %v", tmp_pos)
+	/*
+	 *g.t.Logf("TestLog SplitDepth:%v, MaxDepth:%v", g.SplitDepth(ctx), g.MaxDepth(ctx))
+	 *g.t.Logf("TestLog disputeBlockNum: %v", disputeBlockNum)
+	 *tmp_pos := types.NewPositionFromGIndex(big.NewInt(2))
+	 *g.t.Logf("TestLog tmp_pos.Attack befor pos: %v", tmp_pos)
+	 *g.t.Logf("TestLog tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(0)))
+	 *tmp_pos = tmp_pos.Attack()
+	 *g.t.Logf("TestLog tmp_pos.Attack after pos: %v", tmp_pos)
+	 *g.t.Logf("TestLog tmp_pos.MoveN after pos: %v", tmp_pos.MoveN(1, big.NewInt(1)))
+	 *tmp_pos = tmp_pos.Defend()
+	 *g.t.Logf("TestLog tmp_pos.Defend after tmp_pos: %v", tmp_pos)
+	 */
 
+	// FaultDisputeGame 获取根节点
 	claim := g.RootClaim(ctx)
-	g.t.Logf("root claim: %v", claim)
+	g.t.Logf("TestLog init pos: %v", pos)
+	g.t.Logf("TestLog root claim: %v", claim)
+	// 通过pos的深度判断是否为output叶节点
+	g.t.Logf("TestLog claim.position.Depth(): %v, position:%v", claim.position.Depth(), claim.position)
 	for !claim.IsOutputRootLeaf(ctx) {
 		parentClaimBlockNum, err := g.correctOutputProvider.ClaimedBlockNumber(pos)
 		g.require.NoError(err, "failed to calculate parent claim block number")
 		if parentClaimBlockNum >= disputeBlockNum {
-			g.t.Logf("pos.Attack befor pos: %v", pos)
-			pos = pos.Attack()
-			g.t.Logf("pos.Attack after pos: %v", pos)
-			claim = claim.Attack(ctx, getClaimValue(claim, pos))
+			g.t.Logf("TestLog pos.Attack MoveN befor pos: %v", pos)
+			pos = pos.MoveN(2, 0)
+			g.t.Logf("TestLog pos.Attack MoveN after pos: %v", pos)
+			claim = claim.AttackAt(ctx, getClaimValue(claim, pos), 0)
 		} else {
-			g.t.Logf("pos.Defend befor pos: %v", pos)
-			pos = pos.Defend()
-			g.t.Logf("pos.Defend after pos: %v", pos)
-			claim = claim.Defend(ctx, getClaimValue(claim, pos))
+			g.t.Logf("TestLog pos.Defend MoveN befor pos: %v", pos)
+			pos = pos.MoveN(2, 3)
+			g.t.Logf("TestLog pos.Defend MoveN after pos: %v", pos)
+			claim = claim.AttackAt(ctx, getClaimValue(claim, pos), 3)
 		}
+		g.t.Logf("TestLog claim.position.Depth(): %v, position:%v", claim.position.Depth(), claim.position)
 	}
 	return claim
 }
@@ -633,6 +639,27 @@ func (g *OutputGameHelper) Defend(ctx context.Context, claimIdx int64, claim com
 	}
 }
 
+func (g *OutputGameHelper) AttackAt(ctx context.Context, claimIdx int64, claim common.Hash, branch uint64, opts ...MoveOpt) {
+	g.t.Logf("AttackAt claim %v with value %v, branch %v", claimIdx, claim, branch)
+	cfg := g.moveCfg(opts...)
+
+	claimData, err := g.game.ClaimData(&bind.CallOpts{Context: ctx}, big.NewInt(claimIdx))
+	g.require.NoError(err, "Failed to get claim data")
+	pos := types.NewPositionFromGIndex(claimData.Position)
+	attackPos := pos.MoveN(2, branch)
+	transactOpts := g.makeBondedTransactOpts(ctx, attackPos.ToGIndex(), cfg.opts)
+
+	err = g.sendMove(ctx, func() (*gethtypes.Transaction, error) {
+		return g.game.AttackAt(transactOpts, big.NewInt(claimIdx), claim, branch)
+	})
+	if err != nil {
+		if cfg.ignoreDupes && g.hasClaim(ctx, claimIdx, attackPos, claim) {
+			return
+		}
+		g.require.NoErrorf(err, "AttackAt transaction failed. Game state: \n%v", g.gameData(ctx))
+	}
+}
+
 func (g *OutputGameHelper) hasClaim(ctx context.Context, parentIdx int64, pos types.Position, value common.Hash) bool {
 	claims := g.getAllClaims(ctx)
 	for _, claim := range claims {
@@ -799,6 +826,10 @@ func (g *OutputGameHelper) gameData(ctx context.Context) string {
 
 func (g *OutputGameHelper) LogGameData(ctx context.Context) {
 	g.t.Log(g.gameData(ctx))
+}
+
+func (g *OutputGameHelper) LogGameDataF(ctx context.Context, flag string) {
+	g.t.Logf("TestLog GameData %v, %v", flag, g.gameData(ctx))
 }
 
 func (g *OutputGameHelper) Credit(ctx context.Context, addr common.Address) *big.Int {

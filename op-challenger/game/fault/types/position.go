@@ -133,9 +133,9 @@ func (p Position) Defend() Position {
 	return p.parent().move(true).move(false)
 }
 
-func (p Position) MoveN(bits uint, branch *big.Int) Position {
+func (p Position) MoveN(bits uint, branch uint64) Position {
 	move := new(big.Int)
-	move.Or(branch, p.ToGIndex())
+	move.Or(big.NewInt(0).SetUint64(branch), p.ToGIndex())
 	move.Lsh(move, bits)
 	return NewPositionFromGIndex(move)
 }
