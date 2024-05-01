@@ -65,10 +65,17 @@ func TestSimple_Cannon_ChallengerWins(t *testing.T) {
 	require.NotNil(t, game)
 	claim := game.DisputeLastBlock(ctx)
 
+	opts := challenger.WithPrivKey(sys.Cfg.Secrets.Alice)
+	game.StartChallenger(ctx, "sequencer", "Challenger", opts)
+	game.LogGameData(ctx)
+
 	// Create the root of the cannon trace.
 	//claim = claim.Attack(ctx, common.Hash{0x01})
 	claim = claim.AttackAt(ctx, common.Hash{0x01}, 0)
 	game.LogGameDataF(ctx, "AttackAt[0]")
+
+	claim = claim.AttackAt(ctx, common.Hash{0x02}, 2)
+	game.LogGameDataF(ctx, "AttackAt[2]")
 
 	t.Logf("TestLog GameDuration: %v", game.GameDuration(ctx))
 	sys.TimeTravelClock.AdvanceTime(game.GameDuration(ctx) * 2)
