@@ -108,6 +108,11 @@ func (c *ClaimHelper) Defend(ctx context.Context, value common.Hash, opts ...Mov
 	return c.WaitForCounterClaim(ctx)
 }
 
+func (c *ClaimHelper) AttackAt(ctx context.Context, value common.Hash, branch uint64, opts ...MoveOpt) *ClaimHelper {
+	c.game.AttackAt(ctx, c.index, value, branch, opts...)
+	return c.WaitForCounterClaim(ctx)
+}
+
 func (c *ClaimHelper) RequireDifferentClaimValue(other *ClaimHelper) {
 	c.require.NotEqual(c.claim, other.claim, "should have posted different claims")
 }
