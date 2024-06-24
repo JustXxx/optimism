@@ -361,14 +361,14 @@ contract FaultDisputeGameN_Test is FaultDisputeGame_Init {
         (,,,, Claim root,,) = gameProxy.claimData(0);
         // Attempt to make a move. Should revert.
         vm.expectRevert(GameNotInProgress.selector);
-        gameProxy.attack(root, 0, Claim.wrap(0));
+        gameProxy.attackV2(root, 0, Claim.wrap(0), 0);
     }
 
     /// @dev Tests that an attempt to defend the root claim reverts with the `CannotDefendRootClaim` error.
     function test_move_defendRoot_reverts() public {
         (,,,, Claim root,,) = gameProxy.claimData(0);
         vm.expectRevert(CannotDefendRootClaim.selector);
-        gameProxy.defend(root, 0, _dummyClaim());
+        gameProxy.attackV2(root, 0, _dummyClaim(), 1);
     }
 
     /// @dev Tests that an attempt to move against a claim that does not exist reverts with the
@@ -378,11 +378,11 @@ contract FaultDisputeGameN_Test is FaultDisputeGame_Init {
 
         // Expect an out of bounds revert for an attack
         vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x32));
-        gameProxy.attack(_dummyClaim(), 1, claim);
+        gameProxy.attackV2(_dummyClaim(), 1, claim, 0);
 
         // Expect an out of bounds revert for a defense
         vm.expectRevert(abi.encodeWithSignature("Panic(uint256)", 0x32));
-        gameProxy.defend(_dummyClaim(), 1, claim);
+        gameProxy.attackV2(_dummyClaim(), 1, claim, 3);
     }
 
     /// @dev Tests that an attempt to move at the maximum game depth reverts with the
