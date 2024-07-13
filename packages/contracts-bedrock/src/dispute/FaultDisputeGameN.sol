@@ -292,7 +292,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
                 preStateClaim = ABSOLUTE_PRESTATE;
             } else {
                 (preStateClaim, preStatePos) =
-                    _findTraceAncestorV2(Position.wrap(parentPos.raw() - 1 + _attackBranch), parent.parentIndex, false);
+                    _findTraceAncestorV2(Position.wrap(parentPos.raw() - 1 + _attackBranch), _claimIndex, false);
             }
             // For all attacks, the poststate is the parent claim.
             postStatePos = Position.wrap(parent.position.raw() + _attackBranch);
@@ -303,7 +303,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             preStatePos = Position.wrap(parent.position.raw() + _attackBranch);
             preStateClaim = getClaim(parent, preStatePos);
             (postStateClaim, postStatePos) =
-                _findTraceAncestorV2(Position.wrap(parentPos.raw() + 1 + _attackBranch), parent.parentIndex, false);
+                _findTraceAncestorV2(Position.wrap(parentPos.raw() + 1 + _attackBranch), _claimIndex, false);
         }
 
         // INVARIANT: The prestate is always invalid if the passed `_stateData` is not the
