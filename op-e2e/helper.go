@@ -9,9 +9,11 @@ import (
 	"github.com/ethereum-optimism/optimism/op-e2e/e2eutils"
 )
 
+// 是否开启并行测试
 var enableParallelTesting bool = os.Getenv("OP_E2E_DISABLE_PARALLEL") != "true"
 
 func InitParallel(t e2eutils.TestingBase, args ...func(t e2eutils.TestingBase)) {
+	// testing的helper， 标记为测试函数
 	t.Helper()
 	if enableParallelTesting {
 		t.Parallel()
@@ -19,6 +21,7 @@ func InitParallel(t e2eutils.TestingBase, args ...func(t e2eutils.TestingBase)) 
 	for _, arg := range args {
 		arg(t)
 	}
+	// 函数根据测试名称的哈希值自动分配测试执行器, 测试并行判断相关？
 	autoAllocateExecutor(t)
 }
 
