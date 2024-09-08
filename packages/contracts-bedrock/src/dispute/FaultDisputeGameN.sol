@@ -14,8 +14,18 @@ import { Clone } from "@solady/utils/Clone.sol";
 import { Types } from "src/libraries/Types.sol";
 import { ISemver } from "src/universal/ISemver.sol";
 
+import { Types } from "src/libraries/Types.sol";
+import { Hashing } from "src/libraries/Hashing.sol";
+import { RLPReader } from "src/libraries/rlp/RLPReader.sol";
 import "src/dispute/lib/Types.sol";
 import "src/dispute/lib/Errors.sol";
+import "src/dispute/lib/LibDA.sol";
+
+/// @notice Thrown when an attempt is made to submit an incorrect position
+error InvalidPosition();
+
+/// @notice Thrown when an attempt is made to call a method that is no longer supported
+error NotSupported();
 
 /// @title FaultDisputeGame
 /// @notice An implementation of the `IFaultDisputeGame` interface.
@@ -60,9 +70,14 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     /// @notice The global root claim's position is always at gindex 1.
     Position internal constant ROOT_POSITION = Position.wrap(1);
 
+    /// @notice The index of the block number in the RLP-encoded block header.
+    /// @dev Consensus encoding reference:
+    /// https://github.com/paradigmxyz/reth/blob/5f82993c23164ce8ccdc7bf3ae5085205383a5c8/crates/primitives/src/header.rs#L368
+    uint256 internal constant HEADER_BLOCK_NUMBER_INDEX = 8;
+
     /// @notice Semantic version.
-    /// @custom:semver 0.18.1
-    string public constant version = "0.18.1";
+    /// @custom:semver 1.2.0
+    string public constant version = "1.2.0";
 
     /// @notice The starting timestamp of the game
     Timestamp public createdAt;
@@ -75,6 +90,19 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
     /// @notice Flag for the `initialize` function to prevent re-initialization.
     bool internal initialized;
+
+    /// @notice Bits of N-ary search
+    uint256 internal immutable N_BITS;
+
+    /// @notice Bits of N-ary search
+    uint256 internal immutable MAX_ATTACK_BRANCH;
+
+    /// @notice Flag for whether or not the L2 block number claim has been invalidated via `challengeRootL2Block`.
+    bool public l2BlockNumberChallenged;
+
+    /// @notice The challenger of the L2 block number claim. Should always be `address(0)` if `l2BlockNumberChallenged`
+    ///         is `false`. Should be the address of the challenger if `l2BlockNumberChallenged` is `true`.
+    address public l2BlockNumberChallenger;
 
     /// @notice An append-only array of all claims made during the dispute game.
     ClaimData[] public claimData;
@@ -136,6 +164,9 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         WETH = _weth;
         ANCHOR_STATE_REGISTRY = _anchorStateRegistry;
         L2_CHAIN_ID = _l2ChainId;
+        // N_BITS ** 2 = N-ary
+        N_BITS = 2;
+        MAX_ATTACK_BRANCH = (1 << N_BITS) - 1;
     }
 
     /// @inheritdoc IInitializable
@@ -204,6 +235,11 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         // Set the game as initialized.
         initialized = true;
 
+        require(
+            SPLIT_DEPTH % N_BITS == 0 && MAX_GAME_DEPTH % N_BITS == 0,
+            "SPLIT_DEPTH and MAX_GAME_DEPTH must be multiples of N_BITS"
+        );
+
         // Deposit the bond.
         WETH.deposit{ value: msg.value }();
 
@@ -215,16 +251,26 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     //                  `IFaultDisputeGame` impl                  //
     ////////////////////////////////////////////////////////////////
 
-    /// @inheritdoc IFaultDisputeGame
-    function step(
+    /// @notice Represents the proofs to verify preState/postState and transition in stepV2().
+    /// @custom:field preStateItem      preState with its proof from DA.
+    /// @custom:field postStateItem     postState with its proof from DA.
+    /// @custom:field vmProof           Proof for VM step.
+    struct StepProof {
+        LibDA.DAItem preStateItem;
+        LibDA.DAItem postStateItem;
+        bytes vmProof;
+    }
+
+    function stepV2(
         uint256 _claimIndex,
-        bool _isAttack,
+        uint64 _attackBranch,
         bytes calldata _stateData,
-        bytes calldata _proof
+        StepProof calldata _proof
     )
         public
         virtual
     {
+        require(_attackBranch <= MAX_ATTACK_BRANCH);
         // INVARIANT: Steps cannot be made unless the game is currently in progress.
         if (status != GameStatus.IN_PROGRESS) revert GameNotInProgress();
 
@@ -233,16 +279,17 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
         // Pull the parent position out of storage.
         Position parentPos = parent.position;
-        // Determine the position of the step.
-        Position stepPos = parentPos.move(_isAttack);
-
         // INVARIANT: A step cannot be made unless the move position is 1 below the `MAX_GAME_DEPTH`
-        if (stepPos.depth() != MAX_GAME_DEPTH + 1) revert InvalidParent();
+        if (parentPos.depth() != MAX_GAME_DEPTH) revert InvalidParent();
 
         // Determine the expected pre & post states of the step.
         Claim preStateClaim;
-        ClaimData storage postState;
-        if (_isAttack) {
+        Claim postStateClaim;
+        Position postStatePos;
+        if (MAX_ATTACK_BRANCH != _attackBranch) {
+            uint256 claimIndex = _claimIndex;
+            Position preStatePos;
+
             // If the step position's index at depth is 0, the prestate is the absolute
             // prestate.
             // If the step is an attack at a trace index > 0, the prestate exists elsewhere in
@@ -251,16 +298,34 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             //       the remainder of the index at depth divided by 2 ** (MAX_GAME_DEPTH - SPLIT_DEPTH),
             //       which is the number of leaves in each execution trace subgame. This is so that we can
             //       determine whether or not the step position is represents the `ABSOLUTE_PRESTATE`.
-            preStateClaim = (stepPos.indexAtDepth() % (1 << (MAX_GAME_DEPTH - SPLIT_DEPTH))) == 0
-                ? ABSOLUTE_PRESTATE
-                : _findTraceAncestor(Position.wrap(parentPos.raw() - 1), parent.parentIndex, false).claim;
+            // Determine the position of the step.
+            Position stepPos = parentPos.moveN(N_BITS, _attackBranch);
+            if (stepPos.indexAtDepth() % (1 << (MAX_GAME_DEPTH - SPLIT_DEPTH)) == 0) {
+                preStateClaim = ABSOLUTE_PRESTATE;
+            } else {
+                (preStateClaim, preStatePos) =
+                    _findTraceAncestorV2(
+                        Position.wrap(parentPos.raw() - 1 + _attackBranch),
+                        claimIndex,
+                        false,
+                        _proof.preStateItem);
+            }
             // For all attacks, the poststate is the parent claim.
-            postState = parent;
+            postStatePos = Position.wrap(parent.position.raw() + _attackBranch);
+            postStateClaim = getClaim(parent.claim.raw(), postStatePos, _proof.postStateItem);
         } else {
+            uint256 claimIndex = _claimIndex;
+            Position preStatePos;
+
             // If the step is a defense, the poststate exists elsewhere in the game state,
             // and the parent claim is the expected pre-state.
-            preStateClaim = parent.claim;
-            postState = _findTraceAncestor(Position.wrap(parentPos.raw() + 1), parent.parentIndex, false);
+            preStatePos = Position.wrap(parent.position.raw() + _attackBranch - 1);
+            preStateClaim = getClaim(parent.claim.raw(), preStatePos, _proof.preStateItem);
+            (postStateClaim, postStatePos) =
+                _findExecTraceAncestor(
+                    Position.wrap(parentPos.raw() + _attackBranch),
+                    claimIndex,
+                    _proof.postStateItem);
         }
 
         // INVARIANT: The prestate is always invalid if the passed `_stateData` is not the
@@ -284,8 +349,8 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         // SAFETY:    While the `attack` path does not need an extra check for the post
         //            state's depth in relation to the parent, we don't need another
         //            branch because (n - n) % 2 == 0.
-        bool validStep = VM.step(_stateData, _proof, uuid.raw()) == postState.claim.raw();
-        bool parentPostAgree = (parentPos.depth() - postState.position.depth()) % 2 == 0;
+        bool validStep = VM.step(_stateData, _proof.vmProof, uuid.raw()) == postStateClaim.raw();
+        bool parentPostAgree = ((parentPos.depth() - postStatePos.depth()) / N_BITS) % 2 == 0;
         if (parentPostAgree == validStep) revert ValidStep();
 
         // INVARIANT: A step cannot be made against a claim for a second time.
@@ -296,30 +361,46 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         parent.counteredBy = msg.sender;
     }
 
-    /// @notice Generic move function, used for both `attack` and `defend` moves.
-    /// @param _challengeIndex The index of the claim being moved against.
-    /// @param _claim The claim at the next logical position in the game.
-    /// @param _isAttack Whether or not the move is an attack or defense.
-    function move(uint256 _challengeIndex, Claim _claim, bool _isAttack) public payable virtual {
+    function moveV2(
+        Claim _disputed,
+        uint256 _challengeIndex,
+        Claim _claim,
+        uint64 _attackBranch
+    )
+        internal
+    {
+        // For N = 4 (bisec),
+        // 1. _attackBranch == 0 (attack)
+        // 2. _attackBranch == 1 (attack)
+        // 3. _attackBranch == 2 (attack)
+        // 4. _attackBranch == 3 (defend)
+        require(_attackBranch <= MAX_ATTACK_BRANCH);
         // INVARIANT: Moves cannot be made unless the game is currently in progress.
         if (status != GameStatus.IN_PROGRESS) revert GameNotInProgress();
 
         // Get the parent. If it does not exist, the call will revert with OOB.
         ClaimData memory parent = claimData[_challengeIndex];
 
+        // INVARIANT: The claim at the _challengeIndex must be the disputed claim.
+        if (Claim.unwrap(parent.claim) != Claim.unwrap(_disputed)) revert InvalidDisputedClaimIndex();
+
         // Compute the position that the claim commits to. Because the parent's position is already
         // known, we can compute the next position by moving left or right depending on whether
         // or not the move is an attack or defense.
         Position parentPos = parent.position;
-        Position nextPosition = parentPos.move(_isAttack);
+        Position nextPosition = parentPos.moveN(N_BITS, _attackBranch);
         uint256 nextPositionDepth = nextPosition.depth();
 
         // INVARIANT: A defense can never be made against the root claim of either the output root game or any
         //            of the execution trace bisection subgames. This is because the root claim commits to the
         //            entire state. Therefore, the only valid defense is to do nothing if it is agreed with.
-        if ((_challengeIndex == 0 || nextPositionDepth == SPLIT_DEPTH + 2) && !_isAttack) {
+        if ((_challengeIndex == 0 || nextPositionDepth == SPLIT_DEPTH + 2 * N_BITS) && 0 != _attackBranch) {
             revert CannotDefendRootClaim();
         }
+
+        // INVARIANT: No moves against the root claim can be made after it has been challenged with
+        //            `challengeRootL2Block`.`
+        if (l2BlockNumberChallenged && _challengeIndex == 0) revert L2BlockNumberChallenged();
 
         // INVARIANT: A move can never surpass the `MAX_GAME_DEPTH`. The only option to counter a
         //            claim at this depth is to perform a single instruction step on-chain via
@@ -329,8 +410,8 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
         // When the next position surpasses the split depth (i.e., it is the root claim of an execution
         // trace bisection sub-game), we need to perform some extra verification steps.
-        if (nextPositionDepth == SPLIT_DEPTH + 1) {
-            _verifyExecBisectionRoot(_claim, _challengeIndex, parentPos, _isAttack);
+        if (nextPositionDepth == SPLIT_DEPTH + N_BITS) {
+            _verifyExecMultisectionRoot(_claim, _challengeIndex, parentPos, _attackBranch);
         }
 
         // INVARIANT: The `msg.value` must exactly equal the required bond.
@@ -354,7 +435,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         if (nextDuration.raw() > MAX_CLOCK_DURATION.raw() - CLOCK_EXTENSION.raw()) {
             // If the potential grandchild is an execution trace bisection root, double the clock extension.
             uint64 extensionPeriod =
-                nextPositionDepth == SPLIT_DEPTH - 1 ? CLOCK_EXTENSION.raw() * 2 : CLOCK_EXTENSION.raw();
+                nextPositionDepth == SPLIT_DEPTH - N_BITS ? CLOCK_EXTENSION.raw() * 2 : CLOCK_EXTENSION.raw();
             nextDuration = Duration.wrap(MAX_CLOCK_DURATION.raw() - extensionPeriod);
         }
 
@@ -393,34 +474,57 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     }
 
     /// @inheritdoc IFaultDisputeGame
-    function attack(uint256 _parentIndex, Claim _claim) external payable {
-        move(_parentIndex, _claim, true);
+    function attack(Claim _disputed, uint256 _parentIndex, Claim _claim) external payable {
+        revert NotSupported();
+        //move(_disputed, _parentIndex, _claim, true);
     }
 
     /// @inheritdoc IFaultDisputeGame
-    function defend(uint256 _parentIndex, Claim _claim) external payable {
-        move(_parentIndex, _claim, false);
+    function defend(Claim _disputed, uint256 _parentIndex, Claim _claim) external payable {
+        revert NotSupported();
+        //move(_disputed, _parentIndex, _claim, false);
     }
 
     /// @inheritdoc IFaultDisputeGame
     function addLocalData(uint256 _ident, uint256 _execLeafIdx, uint256 _partOffset) external {
+        revert NotSupported();
+    }
+
+    function addLocalData(uint256 _ident, uint256 _execLeafIdx, uint256 _partOffset, LibDA.DAItem memory _daItem) external returns (Hash uuid_, bytes32 value_) {
         // INVARIANT: Local data can only be added if the game is currently in progress.
         if (status != GameStatus.IN_PROGRESS) revert GameNotInProgress();
 
-        (Claim starting, Position startingPos, Claim disputed, Position disputedPos) =
-            _findStartingAndDisputedOutputs(_execLeafIdx);
-        Hash uuid = _computeLocalContext(starting, startingPos, disputed, disputedPos);
+        (Claim startingRoot, Position startingPos, Claim disputedRoot, Position disputedPos) =
+            _findStartingAndDisputedOutputRoots(_execLeafIdx);
+        uuid_ = _computeLocalContext(startingRoot, startingPos, disputedRoot, disputedPos);
 
         IPreimageOracle oracle = VM.oracle();
         if (_ident == LocalPreimageKey.L1_HEAD_HASH) {
             // Load the L1 head hash
-            oracle.loadLocalData(_ident, uuid.raw(), l1Head().raw(), 32, _partOffset);
+            oracle.loadLocalData(_ident, uuid_.raw(), l1Head().raw(), 32, _partOffset);
+            value_ = l1Head().raw();
         } else if (_ident == LocalPreimageKey.STARTING_OUTPUT_ROOT) {
             // Load the starting proposal's output root.
-            oracle.loadLocalData(_ident, uuid.raw(), starting.raw(), 32, _partOffset);
+            Claim starting;
+            // If the pos is 0, then the root itself is the output hash.
+            if (startingPos.raw() == 0) {
+                starting = startingRoot;
+            } else {
+                starting = getClaim(startingRoot.raw(), startingPos, _daItem);
+            }
+            oracle.loadLocalData(_ident, uuid_.raw(), starting.raw(), 32, _partOffset);
+            value_ = starting.raw();
         } else if (_ident == LocalPreimageKey.DISPUTED_OUTPUT_ROOT) {
             // Load the disputed proposal's output root
-            oracle.loadLocalData(_ident, uuid.raw(), disputed.raw(), 32, _partOffset);
+            Claim disputed;
+            // If the pos is 1, then the rootclaim itself is the output hash.
+            if (disputedPos.raw() == 1) {
+                disputed = disputedRoot;
+            } else {
+                disputed = getClaim(disputedRoot.raw(), disputedPos, _daItem);
+            }
+            oracle.loadLocalData(_ident, uuid_.raw(), disputed.raw(), 32, _partOffset);
+            value_ = disputed.raw();
         } else if (_ident == LocalPreimageKey.DISPUTED_L2_BLOCK_NUMBER) {
             // Load the disputed proposal's L2 block number as a big-endian uint64 in the
             // high order 8 bytes of the word.
@@ -429,10 +533,12 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             // block number.
             uint256 l2Number = startingOutputRoot.l2BlockNumber + disputedPos.traceIndex(SPLIT_DEPTH) + 1;
 
-            oracle.loadLocalData(_ident, uuid.raw(), bytes32(l2Number << 0xC0), 8, _partOffset);
+            oracle.loadLocalData(_ident, uuid_.raw(), bytes32(l2Number << 0xC0), 8, _partOffset);
+            value_ = bytes32(l2Number << 0xC0);
         } else if (_ident == LocalPreimageKey.CHAIN_ID) {
             // Load the chain ID as a big-endian uint64 in the high order 8 bytes of the word.
-            oracle.loadLocalData(_ident, uuid.raw(), bytes32(L2_CHAIN_ID << 0xC0), 8, _partOffset);
+            oracle.loadLocalData(_ident, uuid_.raw(), bytes32(L2_CHAIN_ID << 0xC0), 8, _partOffset);
+            value_ = bytes32(L2_CHAIN_ID << 0xC0);
         } else {
             revert InvalidLocalIdent();
         }
@@ -460,6 +566,54 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     /// @inheritdoc IFaultDisputeGame
     function startingRootHash() external view returns (Hash startingRootHash_) {
         startingRootHash_ = startingOutputRoot.root;
+    }
+
+    /// @notice Challenges the root L2 block number by providing the preimage of the output root and the L2 block header
+    ///         and showing that the committed L2 block number is incorrect relative to the claimed L2 block number.
+    /// @param _outputRootProof The output root proof.
+    /// @param _headerRLP The RLP-encoded L2 block header.
+    function challengeRootL2Block(
+        Types.OutputRootProof calldata _outputRootProof,
+        bytes calldata _headerRLP
+    )
+        external
+    {
+        // INVARIANT: Moves cannot be made unless the game is currently in progress.
+        if (status != GameStatus.IN_PROGRESS) revert GameNotInProgress();
+
+        // The root L2 block claim can only be challenged once.
+        if (l2BlockNumberChallenged) revert L2BlockNumberChallenged();
+
+        // Verify the output root preimage.
+        if (Hashing.hashOutputRootProof(_outputRootProof) != rootClaim().raw()) revert InvalidOutputRootProof();
+
+        // Verify the block hash preimage.
+        if (keccak256(_headerRLP) != _outputRootProof.latestBlockhash) revert InvalidHeaderRLP();
+
+        // Decode the header RLP to find the number of the block. In the consensus encoding, the timestamp
+        // is the 9th element in the list that represents the block header.
+        RLPReader.RLPItem[] memory headerContents = RLPReader.readList(RLPReader.toRLPItem(_headerRLP));
+        bytes memory rawBlockNumber = RLPReader.readBytes(headerContents[HEADER_BLOCK_NUMBER_INDEX]);
+
+        // Sanity check the block number string length.
+        if (rawBlockNumber.length > 32) revert InvalidHeaderRLP();
+
+        // Convert the raw, left-aligned block number to a uint256 by aligning it as a big-endian
+        // number in the low-order bytes of a 32-byte word.
+        //
+        // SAFETY: The length of `rawBlockNumber` is checked above to ensure it is at most 32 bytes.
+        uint256 blockNumber;
+        assembly {
+            blockNumber := shr(shl(0x03, sub(0x20, mload(rawBlockNumber))), mload(add(rawBlockNumber, 0x20)))
+        }
+
+        // Ensure the block number does not match the block number claimed in the dispute game.
+        if (blockNumber == l2BlockNumber()) revert BlockNumberMatches();
+
+        // Issue a special counter to the root claim. This counter will always win the root claim subgame, and receive
+        // the bond from the root claimant.
+        l2BlockNumberChallenger = msg.sender;
+        l2BlockNumberChallenged = true;
     }
 
     ////////////////////////////////////////////////////////////////
@@ -565,16 +719,25 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         if (checkpoint.subgameIndex == challengeIndicesLen) {
             address countered = checkpoint.counteredBy;
 
-            // Once a subgame is resolved, we percolate the result up the DAG so subsequent calls to
-            // resolveClaim will not need to traverse this subgame.
-            subgameRootClaim.counteredBy = countered;
-
             // Mark the subgame as resolved.
             resolvedSubgames[_claimIndex] = true;
 
-            // If the parent was not successfully countered, pay out the parent's bond to the claimant.
-            // If the parent was successfully countered, pay out the parent's bond to the challenger.
-            _distributeBond(countered == address(0) ? subgameRootClaim.claimant : countered, subgameRootClaim);
+            // Distribute the bond to the appropriate party.
+            if (_claimIndex == 0 && l2BlockNumberChallenged) {
+                // Special case: If the root claim has been challenged with the `challengeRootL2Block` function,
+                // the bond is always paid out to the issuer of that challenge.
+                address challenger = l2BlockNumberChallenger;
+                _distributeBond(challenger, subgameRootClaim);
+                subgameRootClaim.counteredBy = challenger;
+            } else {
+                // If the parent was not successfully countered, pay out the parent's bond to the claimant.
+                // If the parent was successfully countered, pay out the parent's bond to the challenger.
+                _distributeBond(countered == address(0) ? subgameRootClaim.claimant : countered, subgameRootClaim);
+
+                // Once a subgame is resolved, we percolate the result up the DAG so subsequent calls to
+                // resolveClaim will not need to traverse this subgame.
+                subgameRootClaim.counteredBy = countered;
+            }
         }
     }
 
@@ -670,9 +833,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         credit[_recipient] = 0;
 
         // Revert if the recipient has no credit to claim.
-        if (recipientCredit == 0) {
-            revert NoCreditToClaim();
-        }
+        if (recipientCredit == 0) revert NoCreditToClaim();
 
         // Try to withdraw the WETH amount so it can be used here.
         WETH.withdraw(_recipient, recipientCredit);
@@ -782,11 +943,11 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     /// @notice Verifies the integrity of an execution bisection subgame's root claim. Reverts if the claim
     ///         is invalid.
     /// @param _rootClaim The root claim of the execution bisection subgame.
-    function _verifyExecBisectionRoot(
+    function _verifyExecMultisectionRoot(
         Claim _rootClaim,
         uint256 _parentIdx,
         Position _parentPos,
-        bool _isAttack
+        uint64 _attackBranch
     )
         internal
         view
@@ -798,11 +959,12 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
 
         // If the move is a defense, the disputed output could have been made by either party. In this case, we
         // need to search for the parent output to determine what the expected status byte should be.
-        Position disputedLeafPos = Position.wrap(_parentPos.raw() + 1);
-        ClaimData storage disputed = _findTraceAncestor({ _pos: disputedLeafPos, _start: _parentIdx, _global: true });
+        Position disputedLeafPos = Position.wrap(_parentPos.raw() + _attackBranch);
+        (, Position disputedPos) =
+            _findTraceAncestorRoot({ _pos: disputedLeafPos, _start: _parentIdx, _global: true });
         uint8 vmStatus = uint8(_rootClaim.raw()[0]);
 
-        if (_isAttack || disputed.position.depth() % 2 == SPLIT_DEPTH % 2) {
+        if ((MAX_ATTACK_BRANCH != _attackBranch) || (disputedPos.depth() / N_BITS) % 2 == (SPLIT_DEPTH / N_BITS) % 2) {
             // If the move is an attack, the parent output is always deemed to be disputed. In this case, we only need
             // to check that the root claim signals that the VM panicked or resulted in an invalid transition.
             // If the move is a defense, and the disputed output and creator of the execution trace subgame disagree,
@@ -846,14 +1008,14 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     /// @notice Finds the starting and disputed output root for a given `ClaimData` within the DAG. This
     ///         `ClaimData` must be below the `SPLIT_DEPTH`.
     /// @param _start The index within `claimData` of the claim to start searching from.
-    /// @return startingClaim_ The starting output root claim.
+    /// @return startingClaimRoot_ The starting output root claim.
     /// @return startingPos_ The starting output root position.
-    /// @return disputedClaim_ The disputed output root claim.
+    /// @return disputedClaimRoot_ The disputed output root claim.
     /// @return disputedPos_ The disputed output root position.
-    function _findStartingAndDisputedOutputs(uint256 _start)
+    function _findStartingAndDisputedOutputRoots(uint256 _start)
         internal
         view
-        returns (Claim startingClaim_, Position startingPos_, Claim disputedClaim_, Position disputedPos_)
+        returns (Claim startingClaimRoot_, Position startingPos_, Claim disputedClaimRoot_, Position disputedPos_)
     {
         // Fatch the starting claim.
         uint256 claimIdx = _start;
@@ -876,7 +1038,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
             // If we're currently at the split depth + 1, we're at the root of the execution sub-game.
             // We need to keep track of the root claim here to determine whether the execution sub-game was
             // started with an attack or defense against the output leaf claim.
-            if (currentDepth == SPLIT_DEPTH + 1) execRootClaim = claim;
+            if (currentDepth == SPLIT_DEPTH + N_BITS) execRootClaim = claim;
 
             claim = claimData[parentIndex];
             claimIdx = parentIndex;
@@ -886,28 +1048,28 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         // above. This is important because it determines which claim is the starting output root and which
         // is the disputed output root.
         (Position execRootPos, Position outputPos) = (execRootClaim.position, claim.position);
-        bool wasAttack = execRootPos.parent().raw() == outputPos.raw();
+        // Equation is (outputPos + attackBranch) * (1 << N_BITS) = execRootPos
+        uint64 attackBranch = uint64(execRootPos.raw() / (1 << N_BITS) - outputPos.raw());
 
         // Determine the starting and disputed output root indices.
         // 1. If it was an attack, the disputed output root is `claim`, and the starting output root is
         //    elsewhere in the DAG (it must commit to the block # index at depth of `outputPos - 1`).
         // 2. If it was a defense, the starting output root is `claim`, and the disputed output root is
         //    elsewhere in the DAG (it must commit to the block # index at depth of `outputPos + 1`).
-        if (wasAttack) {
+        if (attackBranch != MAX_ATTACK_BRANCH) {
             // If this is an attack on the first output root (the block directly after the starting
             // block number), the starting claim nor position exists in the tree. We leave these as
             // 0, which can be easily identified due to 0 being an invalid Gindex.
-            if (outputPos.indexAtDepth() > 0) {
-                ClaimData storage starting = _findTraceAncestor(Position.wrap(outputPos.raw() - 1), claimIdx, true);
-                (startingClaim_, startingPos_) = (starting.claim, starting.position);
+            if (outputPos.indexAtDepth() > 0 || attackBranch > 0) {
+                (startingClaimRoot_, startingPos_) =
+                    _findTraceAncestorRoot(Position.wrap(outputPos.raw() - 1 + attackBranch), claimIdx, true);
             } else {
-                startingClaim_ = Claim.wrap(startingOutputRoot.root.raw());
+                startingClaimRoot_ = Claim.wrap(startingOutputRoot.root.raw());
             }
-            (disputedClaim_, disputedPos_) = (claim.claim, claim.position);
+            (disputedClaimRoot_, disputedPos_) = (claim.claim, Position.wrap(claim.position.raw() + attackBranch));
         } else {
-            ClaimData storage disputed = _findTraceAncestor(Position.wrap(outputPos.raw() + 1), claimIdx, true);
-            (startingClaim_, startingPos_) = (claim.claim, claim.position);
-            (disputedClaim_, disputedPos_) = (disputed.claim, disputed.position);
+            (startingClaimRoot_, startingPos_) = (claim.claim, Position.wrap(claim.position.raw() + attackBranch - 1));
+            (disputedClaimRoot_, disputedPos_) = _findTraceAncestorRoot(Position.wrap(outputPos.raw() + attackBranch), claimIdx, true);
         }
     }
 
@@ -916,7 +1078,7 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
     /// @return uuid_ The local context hash.
     function _findLocalContext(uint256 _claimIndex) internal view returns (Hash uuid_) {
         (Claim starting, Position startingPos, Claim disputed, Position disputedPos) =
-            _findStartingAndDisputedOutputs(_claimIndex);
+            _findStartingAndDisputedOutputRoots(_claimIndex);
         uuid_ = _computeLocalContext(starting, startingPos, disputed, disputedPos);
     }
 
@@ -941,5 +1103,120 @@ contract FaultDisputeGame is IFaultDisputeGame, Clone, ISemver {
         uuid_ = _startingPos.raw() == 0
             ? Hash.wrap(keccak256(abi.encode(_disputed, _disputedPos)))
             : Hash.wrap(keccak256(abi.encode(_starting, _startingPos, _disputed, _disputedPos)));
+    }
+
+    function _findExecTraceAncestor(
+        Position _pos,
+        uint256 _start,
+        LibDA.DAItem memory _daItem
+    )
+        internal
+        view
+        returns (Claim ancestorClaim_, Position ancestorPos_)
+    {
+        Claim ancestorClaimRoot;
+        (ancestorClaimRoot, ancestorPos_) = _findTraceAncestorRoot(_pos, _start, false);
+        // If the ancestor is the root claim, then return the claim directly
+        if (ancestorPos_.depth() == SPLIT_DEPTH + N_BITS) {
+            ancestorClaim_ = ancestorClaimRoot;
+        } else {
+            ancestorClaim_ = getClaim(ancestorClaimRoot.raw(), ancestorPos_, _daItem);
+        }
+    }
+
+    function _findTraceAncestorV2(
+        Position _pos,
+        uint256 _start,
+        bool _global,
+        LibDA.DAItem memory _daItem
+    )
+        internal
+        view
+        returns (Claim ancestorClaim_, Position ancestorPos_)
+    {
+        Claim ancestorClaimRoot;
+        (ancestorClaimRoot, ancestorPos_) = _findTraceAncestorRoot(_pos, _start, _global);
+        ancestorClaim_ = getClaim(ancestorClaimRoot.raw(), _pos, _daItem);
+    }
+
+    function _findTraceAncestorRoot(
+        Position _pos,
+        uint256 _start,
+        bool _global
+    )
+        internal
+        view
+        returns (Claim ancestorClaimRoot_, Position ancestorPos_)
+    {
+        // Grab the trace ancestor's expected position.
+        ancestorPos_ = _global
+            ? _traceAncestorV2(_pos, N_BITS)
+            : _firstValidRightIndex(_pos.traceAncestorBounded(SPLIT_DEPTH), N_BITS);
+
+        uint256 offset = ancestorPos_.raw() % (1 << N_BITS);
+        // If ancestorPos_.raw() == 1, the rootClaim is returned
+        if (ancestorPos_.raw() == 1) {
+            return (rootClaim(), ancestorPos_);
+        }
+        uint256 traceAncestorPosValue = ancestorPos_.raw() - offset;
+        // Walk up the DAG to find a claim that commits to the same trace index as `_pos`. It is
+        // guaranteed that such a claim exists.
+        ClaimData storage ancestor_ = claimData[_start];
+        while (ancestor_.position.raw() != traceAncestorPosValue) {
+            ancestor_ = claimData[ancestor_.parentIndex];
+        }
+        ancestorClaimRoot_ = ancestor_.claim;
+    }
+
+    function _traceAncestorV2(Position _position, uint256 _intervalDepth) internal pure returns (Position ancestor_) {
+        if (_position.depth() % _intervalDepth != 0) {
+            revert InvalidPosition();
+        }
+        ancestor_ = _position.traceAncestor();
+        return _firstValidRightIndex(ancestor_, _intervalDepth);
+    }
+
+    /// @notice The position of the first claim submitted in the current location or subtree.
+    /// @param _position Current location
+    /// @param _intervalDepth The depth of the interval with each submission.
+    /// @return first_ First valid location
+    function _firstValidRightIndex(
+        Position _position,
+        uint256 _intervalDepth
+    )
+        internal
+        pure
+        returns (Position first_)
+    {
+        first_ = _position;
+        for (uint64 start = first_.depth(); start % _intervalDepth != 0; start++) {
+            first_ = first_.right();
+        }
+    }
+
+    function attackV2(Claim _disputed, uint256 _parentIndex, uint64 _attackBranch, uint256 _daType, bytes memory _claims) public payable {
+        Claim claim = Claim.wrap(LibDA.getClaimsHash(_daType, MAX_ATTACK_BRANCH, _claims));
+        moveV2(_disputed, _parentIndex, claim, _attackBranch);
+    }
+
+    function step(
+        uint256 _claimIndex,
+        bool _isAttack,
+        bytes calldata _stateData,
+        bytes calldata _proof
+    )
+        public
+        virtual
+    {
+        revert NotSupported();
+    }
+
+    function move(Claim _disputed, uint256 _challengeIndex, Claim _claim, bool _isAttack) public payable virtual {
+        revert NotSupported();
+    }
+
+    function getClaim(bytes32 _claimRoot, Position _pos, LibDA.DAItem memory _daItem) internal view returns (Claim claim_) {
+        LibDA.verifyClaimHash(_daItem.daType, _claimRoot, MAX_ATTACK_BRANCH, _pos.raw() % (MAX_ATTACK_BRANCH + 1), _daItem.dataHash, _daItem.proof);
+        claim_ = Claim.wrap(_daItem.dataHash);
     }
 }
