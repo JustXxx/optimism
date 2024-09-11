@@ -41,14 +41,14 @@ type CreditExpectation uint8
 
 const (
 	// Max Duration reached
-	CreditBelowMaxDuration CreditExpectation = iota
-	CreditEqualMaxDuration
-	CreditAboveMaxDuration
+	CreditBelowWithdrawable CreditExpectation = iota
+	CreditEqualWithdrawable
+	CreditAboveWithdrawable
 
 	// Max Duration not reached
-	CreditBelowNonMaxDuration
-	CreditEqualNonMaxDuration
-	CreditAboveNonMaxDuration
+	CreditBelowNonWithdrawable
+	CreditEqualNonWithdrawable
+	CreditAboveNonWithdrawable
 )
 
 type GameAgreementStatus uint8
@@ -107,7 +107,7 @@ type ClaimStatuses struct {
 	statuses map[ClaimStatus]int
 }
 
-func (c *ClaimStatuses) RecordClaim(firstHalf bool, clockExpired bool, resolvable bool, resolved bool) {
+func (c *ClaimStatuses) RecordClaim(firstHalf, clockExpired, resolvable, resolved bool) {
 	if c.statuses == nil {
 		c.statuses = make(map[ClaimStatus]int)
 	}
@@ -131,7 +131,7 @@ func (c *ClaimStatuses) ForEachStatus(callback func(status ClaimStatus, count in
 	}
 }
 
-func NewClaimStatus(firstHalf bool, clockExpired bool, resolvable bool, resolved bool) ClaimStatus {
+func NewClaimStatus(firstHalf, clockExpired, resolvable, resolved bool) ClaimStatus {
 	return ClaimStatus{
 		firstHalf:    firstHalf,
 		clockExpired: clockExpired,
@@ -163,6 +163,8 @@ type Metricer interface {
 
 	RecordCredit(expectation CreditExpectation, count int)
 
+	RecordHonestWithdrawableAmounts(map[common.Address]*big.Int)
+
 	RecordClaims(statuses *ClaimStatuses)
 
 	RecordWithdrawalRequests(delayedWeth common.Address, matches bool, count int)
@@ -171,11 +173,13 @@ type Metricer interface {
 
 	RecordGameAgreement(status GameAgreementStatus, count int)
 
+	RecordLatestValidProposalL2Block(latestValid uint64)
+
 	RecordLatestProposals(latestValid, latestInvalid uint64)
 
 	RecordIgnoredGames(count int)
 
-	RecordBondCollateral(addr common.Address, required *big.Int, available *big.Int)
+	RecordBondCollateral(addr common.Address, required, available *big.Int)
 
 	RecordL2Challenges(agreement bool, count int)
 
@@ -208,15 +212,17 @@ type Metrics struct {
 	info prometheus.GaugeVec
 	up   prometheus.Gauge
 
-	credits prometheus.GaugeVec
+	credits                   prometheus.GaugeVec
+	honestWithdrawableAmounts prometheus.GaugeVec
 
 	lastOutputFetch prometheus.Gauge
 
-	gamesAgreement  prometheus.GaugeVec
-	latestProposals prometheus.GaugeVec
-	ignoredGames    prometheus.Gauge
-	failedGames     prometheus.Gauge
-	l2Challenges    prometheus.GaugeVec
+	gamesAgreement             prometheus.GaugeVec
+	latestValidProposalL2Block prometheus.Gauge
+	latestProposals            prometheus.GaugeVec
+	ignoredGames               prometheus.Gauge
+	failedGames                prometheus.Gauge
+	l2Challenges               prometheus.GaugeVec
 
 	requiredCollateral  prometheus.GaugeVec
 	availableCollateral prometheus.GaugeVec
@@ -293,7 +299,14 @@ func NewMetrics() *Metrics {
 			Help:      "Cumulative credits",
 		}, []string{
 			"credit",
-			"max_duration",
+			"withdrawable",
+		}),
+		honestWithdrawableAmounts: *factory.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Name:      "honest_actor_pending_withdrawals",
+			Help:      "Current amount of withdrawable ETH for an honest actor",
+		}, []string{
+			"actor",
 		}),
 		claims: *factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: Namespace,
@@ -322,6 +335,11 @@ func NewMetrics() *Metrics {
 			"completion",
 			"result_correctness",
 			"root_agreement",
+		}),
+		latestValidProposalL2Block: factory.NewGauge(prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Name:      "latest_valid_proposal_l2_block",
+			Help:      "L2 block number proposed by the latest game with a valid root claim",
 		}),
 		latestProposals: *factory.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: Namespace,
@@ -434,23 +452,29 @@ func (m *Metrics) RecordGameResolutionStatus(status ResolutionStatus, count int)
 func (m *Metrics) RecordCredit(expectation CreditExpectation, count int) {
 	asLabels := func(expectation CreditExpectation) []string {
 		switch expectation {
-		case CreditBelowMaxDuration:
-			return []string{"below", "max_duration"}
-		case CreditEqualMaxDuration:
-			return []string{"expected", "max_duration"}
-		case CreditAboveMaxDuration:
-			return []string{"above", "max_duration"}
-		case CreditBelowNonMaxDuration:
-			return []string{"below", "non_max_duration"}
-		case CreditEqualNonMaxDuration:
-			return []string{"expected", "non_max_duration"}
-		case CreditAboveNonMaxDuration:
-			return []string{"above", "non_max_duration"}
+		case CreditBelowWithdrawable:
+			return []string{"below", "withdrawable"}
+		case CreditEqualWithdrawable:
+			return []string{"expected", "withdrawable"}
+		case CreditAboveWithdrawable:
+			return []string{"above", "withdrawable"}
+		case CreditBelowNonWithdrawable:
+			return []string{"below", "non_withdrawable"}
+		case CreditEqualNonWithdrawable:
+			return []string{"expected", "non_withdrawable"}
+		case CreditAboveNonWithdrawable:
+			return []string{"above", "non_withdrawable"}
 		default:
 			panic(fmt.Errorf("unknown credit expectation: %v", expectation))
 		}
 	}
 	m.credits.WithLabelValues(asLabels(expectation)...).Set(float64(count))
+}
+
+func (m *Metrics) RecordHonestWithdrawableAmounts(amounts map[common.Address]*big.Int) {
+	for addr, amount := range amounts {
+		m.honestWithdrawableAmounts.WithLabelValues(addr.Hex()).Set(weiToEther(amount))
+	}
 }
 
 func (m *Metrics) RecordClaims(statuses *ClaimStatuses) {
@@ -479,6 +503,10 @@ func (m *Metrics) RecordGameAgreement(status GameAgreementStatus, count int) {
 	m.gamesAgreement.WithLabelValues(labelValuesFor(status)...).Set(float64(count))
 }
 
+func (m *Metrics) RecordLatestValidProposalL2Block(latestValid uint64) {
+	m.latestValidProposalL2Block.Set(float64(latestValid))
+}
+
 func (m *Metrics) RecordLatestProposals(latestValid, latestInvalid uint64) {
 	m.latestProposals.WithLabelValues("agree").Set(float64(latestValid))
 	m.latestProposals.WithLabelValues("disagree").Set(float64(latestInvalid))
@@ -492,7 +520,7 @@ func (m *Metrics) RecordFailedGames(count int) {
 	m.failedGames.Set(float64(count))
 }
 
-func (m *Metrics) RecordBondCollateral(addr common.Address, required *big.Int, available *big.Int) {
+func (m *Metrics) RecordBondCollateral(addr common.Address, required, available *big.Int) {
 	balanceLabel := "sufficient"
 	zeroBalanceLabel := "insufficient"
 	if required.Cmp(available) > 0 {
@@ -522,7 +550,7 @@ const (
 )
 
 func labelValuesFor(status GameAgreementStatus) []string {
-	asStrings := func(status string, inProgress bool, correct bool, agree bool) []string {
+	asStrings := func(status string, inProgress, correct, agree bool) []string {
 		inProgressStr := "in_progress"
 		if !inProgress {
 			inProgressStr = "complete"

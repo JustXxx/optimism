@@ -7,7 +7,7 @@ import { AnchorStateRegistry, IAnchorStateRegistry } from "src/dispute/AnchorSta
 import { IDelayedWETH } from "src/dispute/interfaces/IDelayedWETH.sol";
 import { StdAssertions } from "forge-std/StdAssertions.sol";
 import "src/dispute/lib/Types.sol";
-import "scripts/Deploy.s.sol";
+import "scripts/deploy/Deploy.s.sol";
 
 /// @notice Deploys the Fault Proof Alpha Chad contracts.
 contract FPACOPS is Deploy, StdAssertions {
@@ -86,12 +86,14 @@ contract FPACOPS is Deploy, StdAssertions {
         address superchainConfigProxy = mustGetAddress("SuperchainConfigProxy");
         Proxy(payable(wethProxy)).upgradeToAndCall(
             mustGetAddress("DelayedWETH"),
-            abi.encodeCall(DelayedWETH.initialize, (msg.sender, SuperchainConfig(superchainConfigProxy)))
+            abi.encodeCall(DelayedWETH.initialize, (msg.sender, ISuperchainConfig(superchainConfigProxy)))
         );
     }
 
     function initializeAnchorStateRegistryProxy() internal broadcast {
         console.log("Initializing AnchorStateRegistryProxy with AnchorStateRegistry.");
+        address superchainConfigProxy = mustGetAddress("SuperchainConfigProxy");
+        ISuperchainConfig superchainConfig = ISuperchainConfig(superchainConfigProxy);
 
         AnchorStateRegistry.StartingAnchorRoot[] memory roots = new AnchorStateRegistry.StartingAnchorRoot[](2);
         roots[0] = AnchorStateRegistry.StartingAnchorRoot({
@@ -111,7 +113,8 @@ contract FPACOPS is Deploy, StdAssertions {
 
         address asrProxy = mustGetAddress("AnchorStateRegistryProxy");
         Proxy(payable(asrProxy)).upgradeToAndCall(
-            mustGetAddress("AnchorStateRegistry"), abi.encodeCall(AnchorStateRegistry.initialize, (roots))
+            mustGetAddress("AnchorStateRegistry"),
+            abi.encodeCall(AnchorStateRegistry.initialize, (roots, superchainConfig))
         );
     }
 

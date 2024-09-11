@@ -16,9 +16,10 @@ import (
 	"github.com/ethereum-optimism/optimism/op-program/host/flags"
 	"github.com/ethereum-optimism/optimism/op-program/host/kvstore"
 	"github.com/ethereum-optimism/optimism/op-program/host/prefetcher"
-	oppio "github.com/ethereum-optimism/optimism/op-program/io"
+	"github.com/ethereum-optimism/optimism/op-program/host/types"
 	opservice "github.com/ethereum-optimism/optimism/op-service"
 	"github.com/ethereum-optimism/optimism/op-service/client"
+	"github.com/ethereum-optimism/optimism/op-service/ctxinterrupt"
 	"github.com/ethereum-optimism/optimism/op-service/sources"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
@@ -36,10 +37,12 @@ func Main(logger log.Logger, cfg *config.Config) error {
 	opservice.ValidateEnvVars(flags.EnvVarPrefix, flags.Flags, logger)
 	cfg.Rollup.LogDescription(logger, chaincfg.L2ChainIDToNetworkDisplayName)
 
-	ctx := context.Background()
+	hostCtx, stop := ctxinterrupt.WithSignalWaiter(context.Background())
+	defer stop()
+	ctx := ctxinterrupt.WithCancelOnInterrupt(hostCtx)
 	if cfg.ServerMode {
-		preimageChan := cl.CreatePreimageChannel()
-		hinterChan := cl.CreateHinterChannel()
+		preimageChan := preimage.ClientPreimageChannel()
+		hinterChan := preimage.ClientHinterChannel()
 		return PreimageServer(ctx, logger, cfg, preimageChan, hinterChan)
 	}
 
@@ -54,8 +57,8 @@ func Main(logger log.Logger, cfg *config.Config) error {
 func FaultProofProgram(ctx context.Context, logger log.Logger, cfg *config.Config) error {
 	var (
 		serverErr chan error
-		pClientRW oppio.FileChannel
-		hClientRW oppio.FileChannel
+		pClientRW preimage.FileChannel
+		hClientRW preimage.FileChannel
 	)
 	defer func() {
 		if pClientRW != nil {
@@ -73,13 +76,13 @@ func FaultProofProgram(ctx context.Context, logger log.Logger, cfg *config.Confi
 		}
 	}()
 	// Setup client I/O for preimage oracle interaction
-	pClientRW, pHostRW, err := oppio.CreateBidirectionalChannel()
+	pClientRW, pHostRW, err := preimage.CreateBidirectionalChannel()
 	if err != nil {
 		return fmt.Errorf("failed to create preimage pipe: %w", err)
 	}
 
 	// Setup client I/O for hint comms
-	hClientRW, hHostRW, err := oppio.CreateBidirectionalChannel()
+	hClientRW, hHostRW, err := preimage.CreateBidirectionalChannel()
 	if err != nil {
 		return fmt.Errorf("failed to create hints pipe: %w", err)
 	}
@@ -120,9 +123,13 @@ func FaultProofProgram(ctx context.Context, logger log.Logger, cfg *config.Confi
 // This method will block until both the hinter and preimage handlers complete.
 // If either returns an error both handlers are stopped.
 // The supplied preimageChannel and hintChannel will be closed before this function returns.
-func PreimageServer(ctx context.Context, logger log.Logger, cfg *config.Config, preimageChannel oppio.FileChannel, hintChannel oppio.FileChannel) error {
+func PreimageServer(ctx context.Context, logger log.Logger, cfg *config.Config, preimageChannel preimage.FileChannel, hintChannel preimage.FileChannel) error {
 	var serverDone chan error
 	var hinterDone chan error
+	logger.Info("Starting preimage server")
+	var kv kvstore.KV
+
+	// Close the preimage/hint channels, and then kv store once the server and hinter have exited.
 	defer func() {
 		preimageChannel.Close()
 		hintChannel.Close()
@@ -134,18 +141,30 @@ func PreimageServer(ctx context.Context, logger log.Logger, cfg *config.Config, 
 			// Wait for hinter to complete
 			<-hinterDone
 		}
+
+		if kv != nil {
+			kv.Close()
+		}
 	}()
-	logger.Info("Starting preimage server")
-	var kv kvstore.KV
+
 	if cfg.DataDir == "" {
 		logger.Info("Using in-memory storage")
 		kv = kvstore.NewMemKV()
 	} else {
-		logger.Info("Creating disk storage", "datadir", cfg.DataDir)
+		logger.Info("Creating disk storage", "datadir", cfg.DataDir, "format", cfg.DataFormat)
 		if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
 			return fmt.Errorf("creating datadir: %w", err)
 		}
-		kv = kvstore.NewDiskKV(cfg.DataDir)
+		switch cfg.DataFormat {
+		case types.DataFormatFile:
+			kv = kvstore.NewFileKV(cfg.DataDir)
+		case types.DataFormatDirectory:
+			kv = kvstore.NewDirectoryKV(cfg.DataDir)
+		case types.DataFormatPebble:
+			kv = kvstore.NewPebbleKV(cfg.DataDir)
+		default:
+			return fmt.Errorf("invalid data format: %s", cfg.DataFormat)
+		}
 	}
 
 	var (
@@ -179,6 +198,9 @@ func PreimageServer(ctx context.Context, logger log.Logger, cfg *config.Config, 
 		return err
 	case err := <-hinterDone:
 		return err
+	case <-ctx.Done():
+		logger.Info("Shutting down")
+		return ctx.Err()
 	}
 }
 

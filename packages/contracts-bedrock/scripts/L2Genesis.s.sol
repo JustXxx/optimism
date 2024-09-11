@@ -3,11 +3,11 @@ pragma solidity 0.8.15;
 
 import { Script } from "forge-std/Script.sol";
 import { console2 as console } from "forge-std/console2.sol";
-import { Deployer } from "scripts/Deployer.sol";
+import { Deployer } from "scripts/deploy/Deployer.sol";
 
-import { Config } from "scripts/Config.sol";
+import { Config, OutputMode, OutputModeUtils, Fork, ForkUtils, LATEST_FORK } from "scripts/libraries/Config.sol";
 import { Artifacts } from "scripts/Artifacts.s.sol";
-import { DeployConfig } from "scripts/DeployConfig.s.sol";
+import { DeployConfig } from "scripts/deploy/DeployConfig.s.sol";
 import { Predeploys } from "src/libraries/Predeploys.sol";
 import { Preinstalls } from "src/libraries/Preinstalls.sol";
 import { L2CrossDomainMessenger } from "src/L2/L2CrossDomainMessenger.sol";
@@ -21,10 +21,11 @@ import { OptimismMintableERC721Factory } from "src/universal/OptimismMintableERC
 import { BaseFeeVault } from "src/L2/BaseFeeVault.sol";
 import { L1FeeVault } from "src/L2/L1FeeVault.sol";
 import { GovernanceToken } from "src/governance/GovernanceToken.sol";
-import { L1CrossDomainMessenger } from "src/L1/L1CrossDomainMessenger.sol";
+import { CrossDomainMessenger } from "src/universal/CrossDomainMessenger.sol";
 import { L1StandardBridge } from "src/L1/L1StandardBridge.sol";
 import { FeeVault } from "src/universal/FeeVault.sol";
 import { EIP1967Helper } from "test/mocks/EIP1967Helper.sol";
+import { Process } from "scripts/libraries/Process.sol";
 
 interface IInitializable {
     function initialize(address _addr) external;
@@ -36,20 +37,6 @@ struct L1Dependencies {
     address payable l1ERC721BridgeProxy;
 }
 
-/// @notice Enum representing different ways of outputting genesis allocs.
-/// @custom:value DEFAULT_LATEST Represents only latest L2 allocs, written to output path.
-/// @custom:value LOCAL_LATEST   Represents latest L2 allocs, not output anywhere, but kept in-process.
-/// @custom:value LOCAL_ECOTONE  Represents Ecotone-upgrade L2 allocs, not output anywhere, but kept in-process.
-/// @custom:value LOCAL_DELTA    Represents Delta-upgrade L2 allocs, not output anywhere, but kept in-process.
-/// @custom:value OUTPUT_ALL     Represents creation of one L2 allocs file for every upgrade.
-enum OutputMode {
-    DEFAULT_LATEST,
-    LOCAL_LATEST,
-    LOCAL_ECOTONE,
-    LOCAL_DELTA,
-    OUTPUT_ALL
-}
-
 /// @title L2Genesis
 /// @notice Generates the genesis state for the L2 network.
 ///         The following safety invariants are used when setting state:
@@ -58,6 +45,9 @@ enum OutputMode {
 ///         2. A contract must be deployed using the `new` syntax if there are immutables in the code.
 ///         Any other side effects from the init code besides setting the immutables must be cleaned up afterwards.
 contract L2Genesis is Deployer {
+    using ForkUtils for Fork;
+    using OutputModeUtils for OutputMode;
+
     uint256 public constant PRECOMPILE_COUNT = 256;
 
     uint80 internal constant DEV_ACCOUNT_FUND_AMT = 10_000 ether;
@@ -119,7 +109,7 @@ contract L2Genesis is Deployer {
     ///         Sets the precompiles, proxies, and the implementation accounts to be `vm.dumpState`
     ///         to generate a L2 genesis alloc.
     function runWithStateDump() public {
-        runWithOptions(OutputMode.DEFAULT_LATEST, artifactDependencies());
+        runWithOptions(Config.outputMode(), cfg.fork(), artifactDependencies());
     }
 
     /// @notice Alias for `runWithStateDump` so that no `--sig` needs to be specified.
@@ -129,11 +119,18 @@ contract L2Genesis is Deployer {
 
     /// @notice This is used by op-e2e to have a version of the L2 allocs for each upgrade.
     function runWithAllUpgrades() public {
-        runWithOptions(OutputMode.OUTPUT_ALL, artifactDependencies());
+        runWithOptions(OutputMode.ALL, LATEST_FORK, artifactDependencies());
+    }
+
+    /// @notice This is used by foundry tests to enable the latest fork with the
+    ///         given L1 dependencies.
+    function runWithLatestLocal(L1Dependencies memory _l1Dependencies) public {
+        runWithOptions(OutputMode.NONE, LATEST_FORK, _l1Dependencies);
     }
 
     /// @notice Build the L2 genesis.
-    function runWithOptions(OutputMode _mode, L1Dependencies memory _l1Dependencies) public {
+    function runWithOptions(OutputMode _mode, Fork _fork, L1Dependencies memory _l1Dependencies) public {
+        console.log("L2Genesis: outputMode: %s, fork: %s", _mode.toString(), _fork.toString());
         vm.startPrank(deployer);
         vm.chainId(cfg.l2ChainID());
 
@@ -146,28 +143,34 @@ contract L2Genesis is Deployer {
         }
         vm.stopPrank();
 
-        // Genesis is "complete" at this point, but some hardfork activation steps remain.
-        // Depending on the "Output Mode" we perform the activations and output the necessary state dumps.
-        if (_mode == OutputMode.LOCAL_DELTA) {
+        if (writeForkGenesisAllocs(_fork, Fork.DELTA, _mode)) {
             return;
-        }
-        if (_mode == OutputMode.OUTPUT_ALL) {
-            writeGenesisAllocs(Config.stateDumpPath("-delta"));
         }
 
         activateEcotone();
 
-        if (_mode == OutputMode.LOCAL_ECOTONE) {
+        if (writeForkGenesisAllocs(_fork, Fork.ECOTONE, _mode)) {
             return;
-        }
-        if (_mode == OutputMode.OUTPUT_ALL) {
-            writeGenesisAllocs(Config.stateDumpPath("-ecotone"));
         }
 
         activateFjord();
 
-        if (_mode == OutputMode.OUTPUT_ALL || _mode == OutputMode.DEFAULT_LATEST) {
-            writeGenesisAllocs(Config.stateDumpPath(""));
+        if (writeForkGenesisAllocs(_fork, Fork.FJORD, _mode)) {
+            return;
+        }
+
+        if (writeForkGenesisAllocs(_fork, Fork.GRANITE, _mode)) {
+            return;
+        }
+    }
+
+    function writeForkGenesisAllocs(Fork _latest, Fork _current, OutputMode _mode) internal returns (bool isLatest_) {
+        if (_mode == OutputMode.ALL || _latest == _current && _mode == OutputMode.LATEST) {
+            string memory suffix = string.concat("-", _current.toString());
+            writeGenesisAllocs(Config.stateDumpPath(suffix));
+        }
+        if (_latest == _current) {
+            isLatest_ = true;
         }
     }
 
@@ -183,7 +186,10 @@ contract L2Genesis is Deployer {
     ///         The Proxy bytecode should be set. All proxied predeploys should have
     ///         the 1967 admin slot set to the ProxyAdmin predeploy. All defined predeploys
     ///         should have their implementations set.
-    ///         Warning: the predeploy accounts have contract code, but 0 nonce value.
+    ///         Warning: the predeploy accounts have contract code, but 0 nonce value, contrary
+    ///         to the expected nonce of 1 per EIP-161. This is because the legacy go genesis
+    //          script didn't set the nonce and we didn't want to change that behavior when
+    ///         migrating genesis generation to Solidity.
     function setPredeployProxies() public {
         console.log("Setting Predeploy proxies");
         bytes memory code = vm.getDeployedCode("Proxy.sol:Proxy");
@@ -246,6 +252,8 @@ contract L2Genesis is Deployer {
         if (cfg.useInterop()) {
             setCrossL2Inbox(); // 22
             setL2ToL2CrossDomainMessenger(); // 23
+            setSuperchainWETH(); // 24
+            setETHLiquidity(); // 25
         }
     }
 
@@ -269,16 +277,24 @@ contract L2Genesis is Deployer {
     function setL2CrossDomainMessenger(address payable _l1CrossDomainMessengerProxy) public {
         address impl = _setImplementationCode(Predeploys.L2_CROSS_DOMAIN_MESSENGER);
 
-        L2CrossDomainMessenger(impl).initialize({ _l1CrossDomainMessenger: L1CrossDomainMessenger(address(0)) });
+        L2CrossDomainMessenger(impl).initialize({ _l1CrossDomainMessenger: CrossDomainMessenger(address(0)) });
 
         L2CrossDomainMessenger(Predeploys.L2_CROSS_DOMAIN_MESSENGER).initialize({
-            _l1CrossDomainMessenger: L1CrossDomainMessenger(_l1CrossDomainMessengerProxy)
+            _l1CrossDomainMessenger: CrossDomainMessenger(_l1CrossDomainMessengerProxy)
         });
     }
 
     /// @notice This predeploy is following the safety invariant #1.
     function setL2StandardBridge(address payable _l1StandardBridgeProxy) public {
-        address impl = _setImplementationCode(Predeploys.L2_STANDARD_BRIDGE);
+        address impl;
+        if (cfg.useInterop()) {
+            string memory cname = "L2StandardBridgeInterop";
+            impl = Predeploys.predeployToCodeNamespace(Predeploys.L2_STANDARD_BRIDGE);
+            console.log("Setting %s implementation at: %s", cname, impl);
+            vm.etch(impl, vm.getDeployedCode(string.concat(cname, ".sol:", cname)));
+        } else {
+            impl = _setImplementationCode(Predeploys.L2_STANDARD_BRIDGE);
+        }
 
         L2StandardBridge(payable(impl)).initialize({ _otherBridge: L1StandardBridge(payable(address(0))) });
 
@@ -341,7 +357,7 @@ contract L2Genesis is Deployer {
     /// @notice This predeploy is following the safety invariant #1.
     function setL1Block() public {
         if (cfg.useInterop()) {
-            string memory cname = "L1BlockInterop";
+            string memory cname = "L1BlockIsthmus";
             address impl = Predeploys.predeployToCodeNamespace(Predeploys.L1_BLOCK_ATTRIBUTES);
             console.log("Setting %s implementation at: %s", cname, impl);
             vm.etch(impl, vm.getDeployedCode(string.concat(cname, ".sol:", cname)));
@@ -464,16 +480,29 @@ contract L2Genesis is Deployer {
         vm.resetNonce(address(eas));
     }
 
-    /// @notice This predeploy is following the saftey invariant #2.
+    /// @notice This predeploy is following the safety invariant #2.
     ///         This contract has no initializer.
     function setCrossL2Inbox() internal {
         _setImplementationCode(Predeploys.CROSS_L2_INBOX);
     }
 
-    /// @notice This predeploy is following the saftey invariant #2.
+    /// @notice This predeploy is following the safety invariant #2.
     ///         This contract has no initializer.
     function setL2ToL2CrossDomainMessenger() internal {
         _setImplementationCode(Predeploys.L2_TO_L2_CROSS_DOMAIN_MESSENGER);
+    }
+
+    /// @notice This predeploy is following the safety invariant #1.
+    ///         This contract has no initializer.
+    function setETHLiquidity() internal {
+        _setImplementationCode(Predeploys.ETH_LIQUIDITY);
+        vm.deal(Predeploys.ETH_LIQUIDITY, type(uint248).max);
+    }
+
+    /// @notice This predeploy is following the safety invariant #1.
+    ///         This contract has no initializer.
+    function setSuperchainWETH() internal {
+        _setImplementationCode(Predeploys.SUPERCHAIN_WETH);
     }
 
     /// @notice Sets all the preinstalls.
@@ -491,9 +520,12 @@ contract L2Genesis is Deployer {
         _setPreinstallCode(Preinstalls.DeterministicDeploymentProxy);
         _setPreinstallCode(Preinstalls.MultiSend_v130);
         _setPreinstallCode(Preinstalls.Permit2);
-        _setPreinstallCode(Preinstalls.SenderCreator);
-        _setPreinstallCode(Preinstalls.EntryPoint); // ERC 4337
+        _setPreinstallCode(Preinstalls.SenderCreator_v060); // ERC 4337 v0.6.0
+        _setPreinstallCode(Preinstalls.EntryPoint_v060); // ERC 4337 v0.6.0
+        _setPreinstallCode(Preinstalls.SenderCreator_v070); // ERC 4337 v0.7.0
+        _setPreinstallCode(Preinstalls.EntryPoint_v070); // ERC 4337 v0.7.0
         _setPreinstallCode(Preinstalls.BeaconBlockRoots);
+        _setPreinstallCode(Preinstalls.CreateX);
         // 4788 sender nonce must be incremented, since it's part of later upgrade-transactions.
         // For the upgrade-tx to not create a contract that conflicts with an already-existing copy,
         // the nonce must be bumped.
@@ -557,7 +589,7 @@ contract L2Genesis is Deployer {
         commands[0] = "bash";
         commands[1] = "-c";
         commands[2] = string.concat("cat <<< $(jq -S '.' ", _path, ") > ", _path);
-        vm.ffi(commands);
+        Process.run(commands);
     }
 
     /// @notice Funds the default dev accounts with ether

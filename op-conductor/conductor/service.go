@@ -72,6 +72,7 @@ func NewOpConductor(
 		ctrl:         ctrl,
 		cons:         cons,
 		hmon:         hmon,
+		retryBackoff: func() time.Duration { return time.Duration(rand.Intn(2000)) * time.Millisecond },
 	}
 	oc.loopActionFn = oc.loopAction
 
@@ -95,7 +96,6 @@ func NewOpConductor(
 		}
 		return nil, err
 	}
-	oc.prevState = NewState(oc.leader.Load(), oc.healthy.Load(), oc.seqActive.Load())
 
 	return oc, nil
 }
@@ -149,7 +149,17 @@ func (c *OpConductor) initConsensus(ctx context.Context) error {
 	}
 
 	serverAddr := fmt.Sprintf("%s:%d", c.cfg.ConsensusAddr, c.cfg.ConsensusPort)
-	cons, err := consensus.NewRaftConsensus(c.log, c.cfg.RaftServerID, serverAddr, c.cfg.RaftStorageDir, c.cfg.RaftBootstrap, &c.cfg.RollupCfg)
+	raftConsensusConfig := &consensus.RaftConsensusConfig{
+		ServerID:          c.cfg.RaftServerID,
+		ServerAddr:        serverAddr,
+		StorageDir:        c.cfg.RaftStorageDir,
+		Bootstrap:         c.cfg.RaftBootstrap,
+		RollupCfg:         &c.cfg.RollupCfg,
+		SnapshotInterval:  c.cfg.RaftSnapshotInterval,
+		SnapshotThreshold: c.cfg.RaftSnapshotThreshold,
+		TrailingLogs:      c.cfg.RaftTrailingLogs,
+	}
+	cons, err := consensus.NewRaftConsensus(c.log, raftConsensusConfig)
 	if err != nil {
 		return errors.Wrap(err, "failed to create raft consensus")
 	}
@@ -280,6 +290,8 @@ type OpConductor struct {
 
 	rpcServer     *oprpc.Server
 	metricsServer *httputil.HTTPServer
+
+	retryBackoff func() time.Duration
 }
 
 type state struct {
@@ -309,7 +321,7 @@ var _ cliapp.Lifecycle = (*OpConductor)(nil)
 func (oc *OpConductor) Start(ctx context.Context) error {
 	oc.log.Info("starting OpConductor")
 
-	if err := oc.hmon.Start(); err != nil {
+	if err := oc.hmon.Start(ctx); err != nil {
 		return errors.Wrap(err, "failed to start health monitor")
 	}
 
@@ -338,6 +350,10 @@ func (oc *OpConductor) Start(ctx context.Context) error {
 	oc.metrics.RecordUp()
 
 	oc.log.Info("OpConductor started")
+	// queue an action in case sequencer is not in the desired state.
+	oc.prevState = NewState(oc.leader.Load(), oc.healthy.Load(), oc.seqActive.Load())
+	oc.queueAction()
+
 	return nil
 }
 
@@ -447,18 +463,18 @@ func (oc *OpConductor) LeaderWithID(_ context.Context) *consensus.ServerInfo {
 }
 
 // AddServerAsVoter adds a server as a voter to the cluster.
-func (oc *OpConductor) AddServerAsVoter(_ context.Context, id string, addr string) error {
-	return oc.cons.AddVoter(id, addr)
+func (oc *OpConductor) AddServerAsVoter(_ context.Context, id string, addr string, version uint64) error {
+	return oc.cons.AddVoter(id, addr, version)
 }
 
 // AddServerAsNonvoter adds a server as a non-voter to the cluster. non-voter will not participate in leader election.
-func (oc *OpConductor) AddServerAsNonvoter(_ context.Context, id string, addr string) error {
-	return oc.cons.AddNonVoter(id, addr)
+func (oc *OpConductor) AddServerAsNonvoter(_ context.Context, id string, addr string, version uint64) error {
+	return oc.cons.AddNonVoter(id, addr, version)
 }
 
 // RemoveServer removes a server from the cluster.
-func (oc *OpConductor) RemoveServer(_ context.Context, id string) error {
-	return oc.cons.RemoveServer(id)
+func (oc *OpConductor) RemoveServer(_ context.Context, id string, version uint64) error {
+	return oc.cons.RemoveServer(id, version)
 }
 
 // TransferLeader transfers leadership to another server.
@@ -482,7 +498,7 @@ func (oc *OpConductor) SequencerHealthy(_ context.Context) bool {
 }
 
 // ClusterMembership returns current cluster's membership information.
-func (oc *OpConductor) ClusterMembership(_ context.Context) ([]*consensus.ServerInfo, error) {
+func (oc *OpConductor) ClusterMembership(_ context.Context) (*consensus.ClusterMembership, error) {
 	return oc.cons.ClusterMembership()
 }
 
@@ -590,11 +606,11 @@ func (oc *OpConductor) action() {
 		// 1. current node is follower, active sequencer became unhealthy and started the leadership transfer process.
 		//    however if leadership transfer took longer than the time for health monitor to treat the node as unhealthy,
 		//    then basically the entire network is stalled and we need to start sequencing in this case.
-		if !oc.prevState.leader && !oc.prevState.active {
-			_, _, cerr := oc.compareUnsafeHead(oc.shutdownCtx)
-			if cerr == nil && !errors.Is(oc.hcerr, health.ErrSequencerConnectionDown) {
-				// if unsafe in consensus is the same as unsafe in op-node, then it is scenario #1 and we should start sequencer.
-				err = oc.startSequencer()
+		if !oc.prevState.leader && !oc.prevState.active && !errors.Is(oc.hcerr, health.ErrSequencerConnectionDown) {
+			err = oc.startSequencer()
+			if err != nil {
+				oc.log.Error("failed to start sequencer, transferring leadership instead", "server", oc.cons.ServerID(), "err", err)
+			} else {
 				break
 			}
 		}
@@ -641,10 +657,12 @@ func (oc *OpConductor) action() {
 
 	oc.log.Debug("exiting action with status and error", "status", status, "err", err)
 	if err != nil {
-		oc.log.Error("failed to execute step, queueing another one to retry", "err", err, "status", status)
-		// randomly sleep for 0-200ms to avoid excessive retry
-		time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
-		oc.queueAction()
+		select {
+		case <-oc.shutdownCtx.Done():
+		case <-time.After(oc.retryBackoff()):
+			oc.log.Error("failed to execute step, queueing another one to retry", "err", err, "status", status)
+			oc.queueAction()
+		}
 		return
 	}
 
@@ -678,18 +696,33 @@ func (oc *OpConductor) transferLeader() error {
 }
 
 func (oc *OpConductor) stopSequencer() error {
-	oc.log.Info("stopping sequencer", "server", oc.cons.ServerID(), "leader", oc.leader.Load(), "healthy", oc.healthy.Load(), "active", oc.seqActive.Load())
+	oc.log.Info(
+		"stopping sequencer",
+		"server", oc.cons.ServerID(),
+		"leader", oc.leader.Load(),
+		"healthy", oc.healthy.Load(),
+		"active", oc.seqActive.Load())
 
-	_, err := oc.ctrl.StopSequencer(context.Background())
-	if err != nil {
+	// Quoting (@zhwrd): StopSequencer is called after conductor loses leadership. In the event that
+	// the StopSequencer call fails, it actually has little real consequences because the sequencer
+	// cant produce a block and gossip / commit it to the raft log (requires leadership). Once
+	// conductor comes back up it will check its leader and sequencer state and attempt to stop the
+	// sequencer again. So it is "okay" to fail to stop a sequencer, the state will eventually be
+	// rectified and we won't have two active sequencers that are actually producing blocks.
+	//
+	// To that end we allow to cancel the StopSequencer call if we're shutting down.
+	latestHead, err := oc.ctrl.StopSequencer(oc.shutdownCtx)
+	if err == nil {
+		// None of the consensus state should have changed here so don't log it again.
+		oc.log.Info("stopped sequencer", "latestHead", latestHead)
+	} else {
 		if strings.Contains(err.Error(), driver.ErrSequencerAlreadyStopped.Error()) {
-			oc.log.Warn("sequencer already stopped.", "err", err)
+			oc.log.Warn("sequencer already stopped", "err", err)
 		} else {
 			return errors.Wrap(err, "failed to stop sequencer")
 		}
 	}
 	oc.metrics.RecordStopSequencer(err == nil)
-
 	oc.seqActive.Store(false)
 	return nil
 }
@@ -701,20 +734,20 @@ func (oc *OpConductor) startSequencer() error {
 	// If not, then we wait for the unsafe head to catch up or gossip it to op-node manually from op-conductor.
 	unsafeInCons, unsafeInNode, err := oc.compareUnsafeHead(ctx)
 	// if there's a mismatch, try to post the unsafe head to op-node
-	if err != nil {
-		if errors.Is(err, ErrUnsafeHeadMismatch) && uint64(unsafeInCons.ExecutionPayload.BlockNumber)-unsafeInNode.NumberU64() == 1 {
-			// tries to post the unsafe head to op-node when head is only 1 block behind (most likely due to gossip delay)
-			oc.log.Debug(
-				"posting unsafe head to op-node",
-				"consensus_num", uint64(unsafeInCons.ExecutionPayload.BlockNumber),
-				"consensus_hash", unsafeInCons.ExecutionPayload.BlockHash.Hex(),
-				"node_num", unsafeInNode.NumberU64(),
-				"node_hash", unsafeInNode.Hash().Hex(),
-			)
-			if innerErr := oc.ctrl.PostUnsafePayload(ctx, unsafeInCons); innerErr != nil {
-				oc.log.Error("failed to post unsafe head payload envelope to op-node", "err", innerErr)
-			}
+	if errors.Is(err, ErrUnsafeHeadMismatch) && uint64(unsafeInCons.ExecutionPayload.BlockNumber)-unsafeInNode.NumberU64() == 1 {
+		// tries to post the unsafe head to op-node when head is only 1 block behind (most likely due to gossip delay)
+		oc.log.Debug(
+			"posting unsafe head to op-node",
+			"consensus_num", uint64(unsafeInCons.ExecutionPayload.BlockNumber),
+			"consensus_hash", unsafeInCons.ExecutionPayload.BlockHash.Hex(),
+			"node_num", unsafeInNode.NumberU64(),
+			"node_hash", unsafeInNode.Hash().Hex(),
+		)
+		if err := oc.ctrl.PostUnsafePayload(ctx, unsafeInCons); err != nil {
+			oc.log.Error("failed to post unsafe head payload envelope to op-node", "err", err)
+			return err
 		}
+	} else if err != nil {
 		return err
 	}
 
