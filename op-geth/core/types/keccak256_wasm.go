@@ -1,9 +1,11 @@
 //go:build js || wasm || wasip1
 // +build js wasm wasip1
+package types
 
-package client
-
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"io"
+)
 
 //go:wasmimport env keccak_new
 //go:noescape
@@ -16,6 +18,51 @@ func keccak_push(uint64)
 //go:wasmimport env keccak_finalize
 //go:noescape
 func keccak_finalize() uint64
+
+func NewHashHelper() *HashHelper {
+	return &HashHelper{}
+}
+
+type HashHelper struct {
+	data []byte
+}
+
+func (b *HashHelper) Write(p []byte) (n int, err error) {
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *HashHelper) WriteTo(w io.Writer) (err error) {
+	w.Write(b.data)
+	return nil
+}
+
+func (b *HashHelper) Hash() [32]byte {
+	size := uint64(len(b.data))
+	padding := size % 136
+	if padding != 0 {
+		padding = 136 - padding
+	} else {
+		padding = 136
+	}
+	buf := make([]byte, size+padding)
+	//wasm_dbg(size)
+	wasm_dbg(size + padding)
+	copy(buf, b.data)
+	hash := Keccak256Hash(buf, size, padding)
+	return hash
+}
+
+/*
+ *func (b HashHelper) PrintData() {
+ *    for _, v := range b.data {
+ *        wasm_dbg(v)
+ *    }
+ *    for i := 0; i < 136; i++ {
+ *        wasm_dbg(v)
+ *    }
+ *}
+ */
 
 var hash [32]byte
 
